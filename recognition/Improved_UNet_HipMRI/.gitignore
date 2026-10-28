@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+runs/
+train_*.out
+train_*.err
+improved_*.out
+improved_*.err
+eval_*.out
+eval_*.err
