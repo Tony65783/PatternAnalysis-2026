@@ -169,6 +169,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=1)
@@ -226,7 +227,7 @@ def main():
         criterion = nn.CrossEntropyLoss()
 
     print(f"Loss function: {args.loss}", flush=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     parameter_count = sum(
         parameter.numel() for parameter in model.parameters()
