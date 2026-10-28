@@ -14,4 +14,4 @@ cd ~/PatternAnalysis-2026/recognition/Improved_UNet_HipMRI
 source "$HOME/miniconda3/bin/activate"
 conda activate torch
 
-python predict.py --indices 0 100 250 400 539
+python predict.py --indices 267 207 513 453 --output-dir evaluation/failure_cases
