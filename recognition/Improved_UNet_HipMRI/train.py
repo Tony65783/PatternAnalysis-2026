@@ -124,6 +124,39 @@ def validate_masks(masks):
         )
 
 
+
+class CombinedDiceCELoss(nn.Module):
+    """Cross-entropy plus multiclass soft Dice loss."""
+
+    def __init__(self, num_classes=6, dice_weight=1.0):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss()
+        self.num_classes = num_classes
+        self.dice_weight = dice_weight
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+
+        probabilities = torch.softmax(logits, dim=1)
+        one_hot = torch.nn.functional.one_hot(
+            targets.long(), num_classes=self.num_classes
+        ).permute(0, 3, 1, 2).float()
+
+        # Exclude background (class 0) from Dice loss.
+        probabilities = probabilities[:, 1:]
+        one_hot = one_hot[:, 1:]
+
+        dims = (0, 2, 3)
+        intersection = (probabilities * one_hot).sum(dim=dims)
+        denominator = probabilities.sum(dim=dims) + one_hot.sum(dim=dims)
+
+        smooth = 1e-5
+        dice = (2 * intersection + smooth) / (denominator + smooth)
+        dice_loss = 1 - dice.mean()
+
+        return ce_loss + self.dice_weight * dice_loss
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -132,6 +165,7 @@ def main():
         choices=["baseline", "improved"],
         default="baseline",
     )
+    parser.add_argument("--loss", choices=["ce", "ce_dice"], default="ce")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -186,7 +220,12 @@ def main():
 
     model = model.to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    if args.loss == "ce_dice":
+        criterion = CombinedDiceCELoss(num_classes=NUM_CLASSES)
+    else:
+        criterion = nn.CrossEntropyLoss()
+
+    print(f"Loss function: {args.loss}", flush=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     parameter_count = sum(
