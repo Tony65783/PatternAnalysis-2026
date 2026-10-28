@@ -1,9 +1,9 @@
 
 import argparse
 import csv
-import os
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -14,7 +14,8 @@ from dataset import HipMRIDataset
 from modules import UNet, ImprovedUNet
 
 
-NUM_CLASSES = 4
+NUM_CLASSES = 6
+CLASS_IDS = list(range(NUM_CLASSES))
 
 
 def set_seed(seed):
@@ -26,79 +27,101 @@ def set_seed(seed):
 
 
 def calculate_metrics(outputs, masks):
-    """Return intersection, predicted count, and actual count per class."""
-    predictions = torch.argmax(outputs, dim=1)
+    predictions = outputs.argmax(dim=1)
 
-    intersections = []
-    predicted_counts = []
-    actual_counts = []
+    intersections = torch.zeros(NUM_CLASSES, dtype=torch.float64)
+    predicted_counts = torch.zeros(NUM_CLASSES, dtype=torch.float64)
+    target_counts = torch.zeros(NUM_CLASSES, dtype=torch.float64)
 
-    for class_id in range(NUM_CLASSES):
+    for class_id in CLASS_IDS:
         predicted = predictions == class_id
         actual = masks == class_id
 
-        intersections.append((predicted & actual).sum().item())
-        predicted_counts.append(predicted.sum().item())
-        actual_counts.append(actual.sum().item())
+        intersections[class_id] = (predicted & actual).sum().item()
+        predicted_counts[class_id] = predicted.sum().item()
+        target_counts[class_id] = actual.sum().item()
 
-    return intersections, predicted_counts, actual_counts
+    return intersections, predicted_counts, target_counts
 
 
-def evaluate(model, loader, criterion, device):
-    """Evaluate validation loss, Dice and IoU."""
+def evaluate(model, loader, criterion, device, max_batches=None):
     model.eval()
 
     total_loss = 0.0
-    intersections = [0] * NUM_CLASSES
-    predicted_counts = [0] * NUM_CLASSES
-    actual_counts = [0] * NUM_CLASSES
+    total_images = 0
+
+    intersections = torch.zeros(NUM_CLASSES, dtype=torch.float64)
+    predicted_counts = torch.zeros(NUM_CLASSES, dtype=torch.float64)
+    target_counts = torch.zeros(NUM_CLASSES, dtype=torch.float64)
 
     with torch.no_grad():
-        for images, masks in loader:
+        for batch_idx, (images, masks) in enumerate(loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
             images = images.to(device)
             masks = masks.to(device)
 
             outputs = model(images)
             loss = criterion(outputs, masks)
 
-            total_loss += loss.item() * images.size(0)
+            batch_size = images.size(0)
+            total_loss += loss.item() * batch_size
+            total_images += batch_size
 
-            batch_inter, batch_pred, batch_actual = calculate_metrics(
-                outputs, masks
+            batch_intersections, batch_predicted, batch_target = (
+                calculate_metrics(outputs, masks)
             )
 
-            for i in range(NUM_CLASSES):
-                intersections[i] += batch_inter[i]
-                predicted_counts[i] += batch_pred[i]
-                actual_counts[i] += batch_actual[i]
-
-    avg_loss = total_loss / len(loader.dataset)
+            intersections += batch_intersections
+            predicted_counts += batch_predicted
+            target_counts += batch_target
 
     dice_scores = []
     iou_scores = []
 
-    for i in range(NUM_CLASSES):
-        intersection = intersections[i]
-        predicted = predicted_counts[i]
-        actual = actual_counts[i]
+    for class_id in CLASS_IDS:
+        intersection = intersections[class_id].item()
+        predicted = predicted_counts[class_id].item()
+        target = target_counts[class_id].item()
 
-        dice_denominator = predicted + actual
-        iou_denominator = predicted + actual - intersection
+        denominator = predicted + target
+        union = denominator - intersection
 
-        dice = (
-            2 * intersection / dice_denominator
-            if dice_denominator > 0 else float("nan")
-        )
+        if denominator == 0:
+            dice = float("nan")
+        else:
+            dice = 2.0 * intersection / denominator
 
-        iou = (
-            intersection / iou_denominator
-            if iou_denominator > 0 else float("nan")
-        )
+        if union == 0:
+            iou = float("nan")
+        else:
+            iou = intersection / union
 
         dice_scores.append(dice)
         iou_scores.append(iou)
 
-    return avg_loss, dice_scores, iou_scores
+    mean_dice = float(np.nanmean(dice_scores))
+    mean_iou = float(np.nanmean(iou_scores))
+
+    return {
+        "loss": total_loss / max(total_images, 1),
+        "dice": dice_scores,
+        "iou": iou_scores,
+        "mean_dice": mean_dice,
+        "mean_iou": mean_iou,
+    }
+
+
+def validate_masks(masks):
+    minimum = masks.min().item()
+    maximum = masks.max().item()
+
+    if minimum < 0 or maximum >= NUM_CLASSES:
+        raise ValueError(
+            f"Invalid mask labels: min={minimum}, max={maximum}. "
+            f"Expected labels from 0 to {NUM_CLASSES - 1}."
+        )
 
 
 def main():
@@ -107,18 +130,20 @@ def main():
     parser.add_argument(
         "--model",
         choices=["baseline", "improved"],
-        default="baseline"
+        default="baseline",
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--num-workers", type=int, default=1)
+
+    # Use these only for short pipeline tests.
+    parser.add_argument("--max-train-batches", type=int, default=None)
+    parser.add_argument("--max-val-batches", type=int, default=None)
 
     args = parser.parse_args()
-
-    if args.epochs < 1 or args.batch_size < 1 or args.lr <= 0:
-        parser.error("Epochs, batch size and learning rate must be positive.")
 
     set_seed(args.seed)
 
@@ -126,20 +151,15 @@ def main():
         "cuda" if torch.cuda.is_available() else "cpu"
     )
 
-    run_name = args.run_name
-    if run_name is None:
-        run_name = f"{args.model}_{int(time.time())}"
+    if args.run_name is None:
+        args.run_name = f"{args.model}_{int(time.time())}"
 
-    if not all(c.isalnum() or c in "-_" for c in run_name):
-        parser.error("Run name may only contain letters, numbers, - and _.")
+    output_dir = Path("runs") / args.run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_dir = os.path.join("runs", run_name)
-    os.makedirs(output_dir, exist_ok=True)
+    print(f"Device: {device}", flush=True)
+    print(f"Run: {args.run_name}", flush=True)
 
-    print("Device:", device)
-    print("Run:", run_name)
-
-    # Load datasets
     train_dataset = HipMRIDataset(split="train")
     val_dataset = HipMRIDataset(split="validate")
 
@@ -147,48 +167,43 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
-        pin_memory=(device.type == "cuda")
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
-        pin_memory=(device.type == "cuda")
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
     )
 
-    print("Training images:", len(train_dataset))
-    print("Validation images:", len(val_dataset))
-
-    # Choose model
     if args.model == "baseline":
-        model = UNet()
+        model = UNet(num_classes=NUM_CLASSES)
     else:
-        model = ImprovedUNet()
+        model = ImprovedUNet(num_classes=NUM_CLASSES)
 
     model = model.to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args.lr
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     parameter_count = sum(
-        p.numel() for p in model.parameters()
+        parameter.numel() for parameter in model.parameters()
     )
 
-    print("Model:", args.model)
-    print("Parameters:", parameter_count)
-    print("Epochs:", args.epochs)
-    print("Batch size:", args.batch_size)
-    print("Learning rate:", args.lr)
-    print("Seed:", args.seed)
+    print(f"Training images: {len(train_dataset)}", flush=True)
+    print(f"Validation images: {len(val_dataset)}", flush=True)
+    print(f"Model: {args.model}", flush=True)
+    print(f"Classes: {NUM_CLASSES}", flush=True)
+    print(f"Parameters: {parameter_count}", flush=True)
+    print(f"Epochs: {args.epochs}", flush=True)
+    print(f"Batch size: {args.batch_size}", flush=True)
+    print(f"Learning rate: {args.lr}", flush=True)
+    print(f"Seed: {args.seed}", flush=True)
 
-    log_path = os.path.join(output_dir, "metrics.csv")
-    checkpoint_path = os.path.join(output_dir, "best_model.pth")
+    csv_path = output_dir / "metrics.csv"
 
     fieldnames = [
         "epoch",
@@ -196,27 +211,42 @@ def main():
         "val_loss",
         "mean_dice",
         "mean_iou",
+        "peak_gpu_memory_mb",
     ]
 
-    for i in range(NUM_CLASSES):
-        fieldnames.append(f"dice_class_{i}")
-        fieldnames.append(f"iou_class_{i}")
+    for class_id in CLASS_IDS:
+        fieldnames.append(f"dice_class_{class_id}")
+        fieldnames.append(f"iou_class_{class_id}")
 
     best_dice = -1.0
 
-    with open(log_path, "w", newline="") as log_file:
-        writer = csv.DictWriter(log_file, fieldnames=fieldnames)
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
 
-        for epoch in range(args.epochs):
+        for epoch in range(1, args.epochs + 1):
             model.train()
-            total_train_loss = 0.0
 
-            for images, masks in train_loader:
-                images = images.to(device)
-                masks = masks.to(device)
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
 
-                optimizer.zero_grad()
+            train_loss = 0.0
+            train_images = 0
+            epoch_start = time.time()
+
+            for batch_idx, (images, masks) in enumerate(train_loader):
+                if (
+                    args.max_train_batches is not None
+                    and batch_idx >= args.max_train_batches
+                ):
+                    break
+
+                validate_masks(masks)
+
+                images = images.to(device, non_blocking=True)
+                masks = masks.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
 
                 outputs = model(images)
                 loss = criterion(outputs, masks)
@@ -224,97 +254,92 @@ def main():
                 loss.backward()
                 optimizer.step()
 
-                total_train_loss += loss.item() * images.size(0)
+                batch_size = images.size(0)
+                train_loss += loss.item() * batch_size
+                train_images += batch_size
 
-            avg_train_loss = total_train_loss / len(train_dataset)
+            average_train_loss = train_loss / max(train_images, 1)
 
-            val_loss, dice_scores, iou_scores = evaluate(
-                model, val_loader, criterion, device
+            val_metrics = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                max_batches=args.max_val_batches,
             )
 
-            valid_dice = [
-                dice_scores[i]
-                for i in range(NUM_CLASSES)
-                if dice_scores[i] == dice_scores[i]
-            ]
-
-            valid_iou = [
-                iou_scores[i]
-                for i in range(NUM_CLASSES)
-                if iou_scores[i] == iou_scores[i]
-            ]
-
-            mean_dice = (
-                sum(valid_dice) / len(valid_dice)
-                if valid_dice else float("nan")
-            )
-
-            mean_iou = (
-                sum(valid_iou) / len(valid_iou)
-                if valid_iou else float("nan")
-            )
+            if device.type == "cuda":
+                peak_memory = (
+                    torch.cuda.max_memory_allocated() / (1024 ** 2)
+                )
+            else:
+                peak_memory = 0.0
 
             row = {
-                "epoch": epoch + 1,
-                "train_loss": avg_train_loss,
-                "val_loss": val_loss,
-                "mean_dice": mean_dice,
-                "mean_iou": mean_iou,
+                "epoch": epoch,
+                "train_loss": average_train_loss,
+                "val_loss": val_metrics["loss"],
+                "mean_dice": val_metrics["mean_dice"],
+                "mean_iou": val_metrics["mean_iou"],
+                "peak_gpu_memory_mb": peak_memory,
             }
 
-            for i in range(NUM_CLASSES):
-                row[f"dice_class_{i}"] = dice_scores[i]
-                row[f"iou_class_{i}"] = iou_scores[i]
+            for class_id in CLASS_IDS:
+                row[f"dice_class_{class_id}"] = (
+                    val_metrics["dice"][class_id]
+                )
+                row[f"iou_class_{class_id}"] = (
+                    val_metrics["iou"][class_id]
+                )
 
             writer.writerow(row)
-            log_file.flush()
+            csv_file.flush()
+
+            elapsed = time.time() - epoch_start
 
             print(
-                f"Epoch {epoch + 1}/{args.epochs} | "
-                f"Train Loss: {avg_train_loss:.4f} | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Mean Dice: {mean_dice:.4f} | "
-                f"Mean IoU: {mean_iou:.4f}",
-                flush=True
+                f"Epoch {epoch}/{args.epochs} | "
+                f"Train Loss: {average_train_loss:.4f} | "
+                f"Val Loss: {val_metrics['loss']:.4f} | "
+                f"Mean Dice: {val_metrics['mean_dice']:.4f} | "
+                f"Mean IoU: {val_metrics['mean_iou']:.4f} | "
+                f"Time: {elapsed:.1f}s",
+                flush=True,
             )
 
             print(
-                "Class Dice:",
-                [round(score, 4) for score in dice_scores],
-                flush=True
+                "Per-class Dice:",
+                [
+                    round(score, 4)
+                    for score in val_metrics["dice"]
+                ],
+                flush=True,
             )
 
-            if mean_dice > best_dice:
-                best_dice = mean_dice
+            if val_metrics["mean_dice"] > best_dice:
+                best_dice = val_metrics["mean_dice"]
 
                 torch.save(
                     {
-                        "epoch": epoch + 1,
+                        "epoch": epoch,
                         "model_name": args.model,
+                        "num_classes": NUM_CLASSES,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "best_val_dice": best_dice,
-                        "dice_scores": dice_scores,
-                        "iou_scores": iou_scores,
-                        "args": vars(args),
+                        "mean_dice": best_dice,
+                        "seed": args.seed,
                     },
-                    checkpoint_path
+                    output_dir / "best_model.pth",
                 )
 
                 print(
-                    f"Saved best checkpoint (Dice: {best_dice:.4f})",
-                    flush=True
+                    f"Saved best model (Dice={best_dice:.4f})",
+                    flush=True,
                 )
 
-    if device.type == "cuda":
-        print(
-            "Peak GPU memory (MB):",
-            round(torch.cuda.max_memory_allocated() / 1024**2, 2)
-        )
-
-    print("Training completed.")
-    print("Best validation Dice:", round(best_dice, 4))
-    print("Results saved to:", output_dir)
+    print("Training completed.", flush=True)
+    print(f"Best validation mean Dice: {best_dice:.4f}", flush=True)
+    print(f"Results saved to: {output_dir}", flush=True)
 
 
 if __name__ == "__main__":
