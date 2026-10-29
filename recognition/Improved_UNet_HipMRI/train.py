@@ -1,4 +1,3 @@
-
 import argparse
 import csv
 import random
@@ -19,14 +18,22 @@ CLASS_IDS = list(range(NUM_CLASSES))
 
 
 def set_seed(seed):
+    """Set random seeds to make experiments more reproducible."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
 def calculate_metrics(outputs, masks):
+    """
+    Count predicted pixels, target pixels and intersections per class.
+
+    These counts are combined across validation batches before
+    calculating Dice and IoU scores.
+    """
     predictions = outputs.argmax(dim=1)
 
     intersections = torch.zeros(NUM_CLASSES, dtype=torch.float64)
@@ -45,6 +52,13 @@ def calculate_metrics(outputs, masks):
 
 
 def evaluate(model, loader, criterion, device, max_batches=None):
+    """
+    Evaluate the model using validation loss, Dice and IoU.
+
+    Metrics are calculated from pixel counts across the selected
+    validation batches. Classes absent from both prediction and
+    ground truth are excluded from the mean.
+    """
     model.eval()
 
     total_loss = 0.0
@@ -69,6 +83,7 @@ def evaluate(model, loader, criterion, device, max_batches=None):
             total_loss += loss.item() * batch_size
             total_images += batch_size
 
+            # Collect pixel counts for each segmentation class.
             batch_intersections, batch_predicted, batch_target = (
                 calculate_metrics(outputs, masks)
             )
@@ -88,6 +103,7 @@ def evaluate(model, loader, criterion, device, max_batches=None):
         denominator = predicted + target
         union = denominator - intersection
 
+        # Avoid dividing by zero when a class is absent.
         if denominator == 0:
             dice = float("nan")
         else:
@@ -101,6 +117,7 @@ def evaluate(model, loader, criterion, device, max_batches=None):
         dice_scores.append(dice)
         iou_scores.append(iou)
 
+    # Average across classes, including background when present.
     mean_dice = float(np.nanmean(dice_scores))
     mean_iou = float(np.nanmean(iou_scores))
 
@@ -114,6 +131,7 @@ def evaluate(model, loader, criterion, device, max_batches=None):
 
 
 def validate_masks(masks):
+    """Check that segmentation masks contain labels from 0 to 5."""
     minimum = masks.min().item()
     maximum = masks.max().item()
 
@@ -124,12 +142,17 @@ def validate_masks(masks):
         )
 
 
-
 class CombinedDiceCELoss(nn.Module):
-    """Cross-entropy plus multiclass soft Dice loss."""
+    """
+    Combine cross-entropy loss with multiclass soft Dice loss.
+
+    Cross-entropy uses all six classes. The Dice component
+    excludes background to focus on anatomical regions.
+    """
 
     def __init__(self, num_classes=6, dice_weight=1.0):
         super().__init__()
+
         self.ce = nn.CrossEntropyLoss()
         self.num_classes = num_classes
         self.dice_weight = dice_weight
@@ -137,19 +160,27 @@ class CombinedDiceCELoss(nn.Module):
     def forward(self, logits, targets):
         ce_loss = self.ce(logits, targets)
 
+        # Convert model logits into class probabilities.
         probabilities = torch.softmax(logits, dim=1)
+
+        # Convert integer mask labels into one-hot class masks.
         one_hot = torch.nn.functional.one_hot(
-            targets.long(), num_classes=self.num_classes
+            targets.long(),
+            num_classes=self.num_classes,
         ).permute(0, 3, 1, 2).float()
 
-        # Exclude background (class 0) from Dice loss.
+        # Exclude background (class 0) from the Dice component.
         probabilities = probabilities[:, 1:]
         one_hot = one_hot[:, 1:]
 
         dims = (0, 2, 3)
-        intersection = (probabilities * one_hot).sum(dim=dims)
-        denominator = probabilities.sum(dim=dims) + one_hot.sum(dim=dims)
 
+        intersection = (probabilities * one_hot).sum(dim=dims)
+        denominator = (
+            probabilities.sum(dim=dims) + one_hot.sum(dim=dims)
+        )
+
+        # Smoothing prevents division by zero.
         smooth = 1e-5
         dice = (2 * intersection + smooth) / (denominator + smooth)
         dice_loss = 1 - dice.mean()
@@ -158,14 +189,23 @@ class CombinedDiceCELoss(nn.Module):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    """Configure and run a baseline or Improved U-Net experiment."""
 
+    parser = argparse.ArgumentParser(
+        description="Train a U-Net model on the HipMRI dataset."
+    )
+
+    # Model and training settings
     parser.add_argument(
         "--model",
         choices=["baseline", "improved"],
         default="baseline",
     )
-    parser.add_argument("--loss", choices=["ce", "ce_dice"], default="ce")
+    parser.add_argument(
+        "--loss",
+        choices=["ce", "ce_dice"],
+        default="ce",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -174,7 +214,7 @@ def main():
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=1)
 
-    # Use these only for short pipeline tests.
+    # Optional limits for short pipeline tests.
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-val-batches", type=int, default=None)
 
@@ -186,6 +226,7 @@ def main():
         "cuda" if torch.cuda.is_available() else "cpu"
     )
 
+    # Create a separate output folder for each experiment.
     if args.run_name is None:
         args.run_name = f"{args.model}_{int(time.time())}"
 
@@ -195,6 +236,7 @@ def main():
     print(f"Device: {device}", flush=True)
     print(f"Run: {args.run_name}", flush=True)
 
+    # Load the supplied training and validation splits.
     train_dataset = HipMRIDataset(split="train")
     val_dataset = HipMRIDataset(split="validate")
 
@@ -214,6 +256,7 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
+    # Select the baseline or residual U-Net architecture.
     if args.model == "baseline":
         model = UNet(num_classes=NUM_CLASSES)
     else:
@@ -221,13 +264,19 @@ def main():
 
     model = model.to(device)
 
+    # Select the loss function used for this experiment.
     if args.loss == "ce_dice":
         criterion = CombinedDiceCELoss(num_classes=NUM_CLASSES)
     else:
         criterion = nn.CrossEntropyLoss()
 
     print(f"Loss function: {args.loss}", flush=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
     parameter_count = sum(
         parameter.numel() for parameter in model.parameters()
@@ -243,6 +292,7 @@ def main():
     print(f"Learning rate: {args.lr}", flush=True)
     print(f"Seed: {args.seed}", flush=True)
 
+    # Save training and validation metrics after each epoch.
     csv_path = output_dir / "metrics.csv"
 
     fieldnames = [
@@ -274,6 +324,7 @@ def main():
             train_images = 0
             epoch_start = time.time()
 
+            # Training phase
             for batch_idx, (images, masks) in enumerate(train_loader):
                 if (
                     args.max_train_batches is not None
@@ -291,6 +342,7 @@ def main():
                 outputs = model(images)
                 loss = criterion(outputs, masks)
 
+                # Update model weights using backpropagation.
                 loss.backward()
                 optimizer.step()
 
@@ -300,6 +352,7 @@ def main():
 
             average_train_loss = train_loss / max(train_images, 1)
 
+            # Validation phase
             val_metrics = evaluate(
                 model,
                 val_loader,
@@ -308,6 +361,7 @@ def main():
                 max_batches=args.max_val_batches,
             )
 
+            # Record peak allocated GPU memory for this epoch.
             if device.type == "cuda":
                 peak_memory = (
                     torch.cuda.max_memory_allocated() / (1024 ** 2)
@@ -356,6 +410,7 @@ def main():
                 flush=True,
             )
 
+            # Save the checkpoint with the highest validation Dice.
             if val_metrics["mean_dice"] > best_dice:
                 best_dice = val_metrics["mean_dice"]
 
